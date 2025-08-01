@@ -1,0 +1,194 @@
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to release (e.g., v0.0.1)'
+        required: true
+        default: 'v0.0.1'
+
+jobs:
+  build:
+    name: Build ${{ matrix.os }}-${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      matrix:
+        include:
+          # Linux builds
+          - os: linux
+            arch: x86_64
+            runner: ubuntu-latest
+            target: x86_64-linux-gnu
+          - os: linux
+            arch: arm64
+            runner: ubuntu-latest
+            target: aarch64-linux-gnu
+
+          # Windows builds
+          - os: windows
+            arch: x86_64
+            runner: windows-latest
+            target: x86_64-windows
+          - os: windows
+            arch: arm64
+            runner: windows-latest
+            target: arm64-windows
+
+          # macOS builds
+          - os: macos
+            arch: x86_64
+            runner: macos-latest
+            target: x86_64-apple-darwin
+          - os: macos
+            arch: arm64
+            runner: macos-latest
+            target: arm64-apple-darwin
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup build environment (Linux ARM64)
+      if: matrix.os == 'linux' && matrix.arch == 'arm64'
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
+
+    - name: Configure CMake (Linux x86_64)
+      if: matrix.os == 'linux' && matrix.arch == 'x86_64'
+      run: |
+        cmake -B build -DCMAKE_BUILD_TYPE=Release
+
+    - name: Configure CMake (Linux ARM64)
+      if: matrix.os == 'linux' && matrix.arch == 'arm64'
+      run: |
+        cmake -B build -DCMAKE_BUILD_TYPE=Release \
+          -DCMAKE_C_COMPILER=aarch64-linux-gnu-gcc \
+          -DCMAKE_SYSTEM_NAME=Linux \
+          -DCMAKE_SYSTEM_PROCESSOR=aarch64
+
+    - name: Configure CMake (Windows x86_64)
+      if: matrix.os == 'windows' && matrix.arch == 'x86_64'
+      run: |
+        cmake -B build -DCMAKE_BUILD_TYPE=Release -A x64
+
+    - name: Configure CMake (Windows ARM64)
+      if: matrix.os == 'windows' && matrix.arch == 'arm64'
+      run: |
+        cmake -B build -DCMAKE_BUILD_TYPE=Release -A ARM64
+
+    - name: Configure CMake (macOS x86_64)
+      if: matrix.os == 'macos' && matrix.arch == 'x86_64'
+      run: |
+        cmake -B build -DCMAKE_BUILD_TYPE=Release \
+          -DCMAKE_OSX_ARCHITECTURES=x86_64
+
+    - name: Configure CMake (macOS ARM64)
+      if: matrix.os == 'macos' && matrix.arch == 'arm64'
+      run: |
+        cmake -B build -DCMAKE_BUILD_TYPE=Release \
+          -DCMAKE_OSX_ARCHITECTURES=arm64
+
+    - name: Build
+      run: cmake --build build --config Release
+
+    - name: Package artifacts (Linux/macOS)
+      if: matrix.os != 'windows'
+      run: |
+        mkdir -p dist
+        cp build/spd dist/
+        cp README.md dist/
+        cp LICENSE.md dist/
+        cd dist
+        tar -czf ../spd-${{ matrix.target }}.tar.gz *
+
+    - name: Package artifacts (Windows)
+      if: matrix.os == 'windows'
+      run: |
+        mkdir dist
+        copy build\Release\spd.exe dist\
+        copy README.md dist\
+        copy LICENSE.md dist\
+        cd dist
+        tar -czf ..\spd-${{ matrix.target }}.tar.gz *
+
+    - name: Upload artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: spd-${{ matrix.target }}
+        path: spd-${{ matrix.target }}.tar.gz
+
+  release:
+    name: Create Release
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Download all artifacts
+      uses: actions/download-artifact@v4
+      with:
+        path: artifacts
+
+    - name: Get version
+      id: get_version
+      run: |
+        if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+          echo "version=${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
+        else
+          echo "version=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Create Release
+      id: create_release
+      uses: actions/create-release@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        tag_name: ${{ steps.get_version.outputs.version }}
+        release_name: SMS PDU Decoder ${{ steps.get_version.outputs.version }}
+        body: |
+          ## SMS PDU Decoder ${{ steps.get_version.outputs.version }}
+          
+          Cross-platform SMS Protocol Data Unit decoder utility.
+          
+          ### Features
+          - Supports SMS-DELIVER, SMS-SUBMIT, SMS-STATUS-REPORT PDU types
+          - Human-readable address formatting (E.164 and alphanumeric)
+          - TP-PID decoding according to TS 123.040
+          - Service Centre timestamp formatting with timezone
+          - Multi-platform support (Windows, Linux, macOS)
+          
+          ### Platforms
+          - **Linux**: x86_64, ARM64
+          - **Windows**: x86_64, ARM64  
+          - **macOS**: x86_64 (Intel), ARM64 (Apple Silicon)
+          
+          ### Usage
+          ```bash
+          ./spd --pdu <HEX_STRING>
+          ```
+          
+          Download the appropriate archive for your platform, extract it, and run the `spd` executable.
+        draft: false
+        prerelease: false
+
+    - name: Upload Release Assets
+      run: |
+        for file in artifacts/*/spd-*.tar.gz; do
+          filename=$(basename "$file")
+          echo "Uploading $filename"
+          curl \
+            -X POST \
+            -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Content-Type: application/gzip" \
+            --data-binary @"$file" \
+            "${{ steps.create_release.outputs.upload_url }}?name=$filename"
+        done
