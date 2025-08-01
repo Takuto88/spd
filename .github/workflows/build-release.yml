@@ -127,10 +127,15 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    permissions:
+      contents: write
+      packages: write
 
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
+      with:
+        fetch-depth: 0  # Fetch all history for git log
 
     - name: Download all artifacts
       uses: actions/download-artifact@v4
@@ -146,49 +151,51 @@ jobs:
           echo "version=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
         fi
 
-    - name: Create Release
-      id: create_release
-      uses: actions/create-release@v1
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      with:
-        tag_name: ${{ steps.get_version.outputs.version }}
-        release_name: SMS PDU Decoder ${{ steps.get_version.outputs.version }}
-        body: |
-          ## SMS PDU Decoder ${{ steps.get_version.outputs.version }}
-          
-          Cross-platform SMS Protocol Data Unit decoder utility.
-          
-          ### Features
-          - Supports SMS-DELIVER, SMS-SUBMIT, SMS-STATUS-REPORT PDU types
-          - Human-readable address formatting (E.164 and alphanumeric)
-          - TP-PID decoding according to TS 123.040
-          - Service Centre timestamp formatting with timezone
-          - Multi-platform support (Windows, Linux, macOS)
-          
-          ### Platforms
-          - **Linux**: x86_64, ARM64
-          - **Windows**: x86_64, ARM64  
-          - **macOS**: x86_64 (Intel), ARM64 (Apple Silicon)
-          
-          ### Usage
-          ```bash
-          ./spd --pdu <HEX_STRING>
-          ```
-          
-          Download the appropriate archive for your platform, extract it, and run the `spd` executable.
-        draft: false
-        prerelease: false
-
-    - name: Upload Release Assets
+    - name: Prepare release files
       run: |
-        for file in artifacts/*/spd-*.tar.gz; do
-          filename=$(basename "$file")
-          echo "Uploading $filename"
-          curl \
-            -X POST \
-            -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
-            -H "Content-Type: application/gzip" \
-            --data-binary @"$file" \
-            "${{ steps.create_release.outputs.upload_url }}?name=$filename"
-        done
+        mkdir -p release-files
+        find artifacts -name "*.tar.gz" -exec cp {} release-files/ \;
+        ls -la release-files/
+
+    - name: Create Release
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        # Get the previous tag to generate changelog
+        PREVIOUS_TAG=$(git tag --sort=-version:refname | head -2 | tail -1)
+        CURRENT_TAG="${{ steps.get_version.outputs.version }}"
+        
+        # If this is the first release, use all commits
+        if [ -z "$PREVIOUS_TAG" ] || [ "$PREVIOUS_TAG" = "$CURRENT_TAG" ]; then
+          COMMIT_RANGE=""
+          echo "First release - including all commits"
+        else
+          COMMIT_RANGE="${PREVIOUS_TAG}..HEAD"
+          echo "Generating changelog from $PREVIOUS_TAG to HEAD"
+        fi
+        
+        # Generate release notes with git log
+        cat > release-notes.md << EOF
+        ## SMS PDU Decoder ${{ steps.get_version.outputs.version }}
+        
+        Cross-platform SMS Protocol Data Unit decoder utility.
+        
+        ### What's Changed
+        EOF
+        
+        # Add commit messages to release notes
+        if [ -n "$COMMIT_RANGE" ]; then
+          git log $COMMIT_RANGE --pretty=format:"- %s" --no-merges >> release-notes.md
+        else
+          git log --pretty=format:"- %s" --no-merges >> release-notes.md
+        fi
+        
+        # Show the generated release notes for debugging
+        echo "Generated release notes:"
+        cat release-notes.md
+        
+        # Create the release
+        gh release create "${{ steps.get_version.outputs.version }}" \
+          --title "SMS PDU Decoder ${{ steps.get_version.outputs.version }}" \
+          --notes-file release-notes.md \
+          release-files/*
